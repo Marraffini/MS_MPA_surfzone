@@ -1,0 +1,394 @@
+---
+title: "Evaluating the Influence of Marine Protected Areas on Surf Zone Fish"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+```{r libraries, echo = FALSE, warning = FALSE, message = FALSE}
+library("lme4")
+library("readxl")
+library("ggh4x")
+library("dplyr")
+library("AICcmodavg")
+library("MuMIn")
+require("pscl")
+require("MASS")
+require("boot")
+library("DHARMa")
+library("emmeans")
+library("ggthemes")
+
+library("lmerTest")
+
+suppressPackageStartupMessages(library("tidyverse")) 
+suppressPackageStartupMessages(library("janitor"))
+suppressPackageStartupMessages(library("knitr")) # to kable
+suppressPackageStartupMessages(library("flextable")) #to flextable
+
+# set seed so analyses are reproducible 
+set.seed(123)
+```
+
+Our goal is to investigate the ecological effectiveness of California MPAs for surfzone fish - through biological metrics of richness, abundance, and biomass. To do this we used MPA status and region as fixed effects in a mixed effect model. Random effects for site pairs were included to account possible spatial autocorrelation between nearby sites and to account for any variability not accounted for in the region term (Pinheiro and Bates 2000). A log(x+1) transformation for all response variables. Multicollinearity between predictor variables, distributions of residuals, normality and over-dispersion were checked using variance inflation factors for mixed models, residual plots and Q-Q plots and were all found to be acceptable in the final mixed model. 
+
+The following code illustrates the workflow employed in this manuscript and acts as an example of they analyses conducted. Additional analyses are described in the text and can be recreated from the data in this workflow.
+
+## Seines
+```{r load seine data, echo = FALSE, warning = FALSE, message = FALSE}
+# seine observations
+seines <- read.csv("../data/seine_fish_19_20.csv", row.names=1) 
+
+```
+
+
+```{r generate response metrics, echo = FALSE, warning = FALSE, message = FALSE}
+# generate response metrics: CPUE, RPUE, BPUE
+# generates a df of the number of hauls pulled per sampling day at each site
+site_samplingdate_no_haul <- seines %>%
+  group_by(region, mpa_status, site_name, site_pair,  year, month, day, month_day) %>%
+  dplyr::summarise( num_hauls = length(unique(month_day_haul_no))) 
+
+# counts abundance, richness, and biomass for each haul 
+catch_summary_by_site_haul <- seines %>%
+  filter(species_code !="NOSP") %>% # remove observations that did not catch any fish
+  group_by(region, mpa_status, site_name, site_pair, haul_number, year, month, day, month_day) %>%
+  dplyr::summarise(abund = sum(count), 
+                   sp_richness = length(unique(species_code)),
+                   bio = sum(fish_weight, na.rm = TRUE)) # how much is caught in each haul
+
+catch_summary_by_site_sampling <- 
+  site_samplingdate_no_haul %>%
+  left_join(catch_summary_by_site_haul) %>%
+  group_by(region, mpa_status, site_name, site_pair,  year, month, day, month_day) %>% 
+  dplyr::reframe( num_hauls = num_hauls, 
+                    # abundance
+                    abundance = sum(abund), # add up all the hauls on a given sampling date
+                    CPUE = abundance/num_hauls, # all sites have different haul numbers
+                    # richness
+                    species_richness = sum(sp_richness),
+                    RPUE=species_richness/num_hauls,
+                    # biomass
+                    biomass = sum(bio),
+                    BPUE= biomass/num_hauls
+  ) %>% distinct()
+
+catch_summary_by_site_sampling[is.na(catch_summary_by_site_sampling)] <- 0 # fill in the sampling dates at sites where no fish were caught
+
+# Create a column to identify sampling event
+catch_summary_by_site_sampling <- catch_summary_by_site_sampling %>%
+  group_by(region, site_pair, site_name, year) %>%
+  mutate(sampling_event = match(month_day, unique(month_day))) 
+
+ catch_summary_by_site_sampling$mpa_status <- as.factor(catch_summary_by_site_sampling$mpa_status)
+  catch_summary_by_site_sampling$region <- as.factor(catch_summary_by_site_sampling$region)
+```
+
+
+Richness model
+```{r}
+mod_log_rpue <- lmer(log1p(RPUE)~0+mpa_status*region+(1|site_pair),  data=catch_summary_by_site_sampling)
+as_flextable(mod_log_rpue) %>%   colformat_double(digits = 2)
+```
+Pseudo $R^2$ results
+```{r}
+rsq_rpue <- r.squaredGLMM(mod_log_rpue)
+```
+
+
+Anova table of results
+```{r rpue, echo = FALSE, warning = FALSE, message = FALSE}
+aov_rpue <- anova(mod_log_rpue, type="3", ddf="Kenward-Roger")
+as_flextable(aov_rpue) %>%   colformat_double(digits = 2)
+```
+
+Assumptions
+```{r assumpt rpue, echo = FALSE, warning = FALSE, message = FALSE}
+res_rpue <- simulateResiduals(mod_log_rpue, plot = T)# check for over dispersion 
+```
+
+Post hoc results
+```{r posthoc rpue, echo = FALSE, warning = FALSE, message = FALSE}
+post_rpue_int <- emmeans(mod_log_rpue, list(pairwise ~ mpa_status | region), adjust = "tukey", type = "response")
+post_rpue_int
+post_rpue_region <- emmeans(mod_log_rpue, list(pairwise ~ region ), adjust = "tukey", type = "response")
+post_rpue_region
+post_rpue_mpa <- emmeans(mod_log_rpue, list(pairwise ~ mpa_status ), adjust = "tukey", type = "response")
+post_rpue_mpa
+```
+
+
+
+## BRUVs
+```{r load maxN data}
+maxn_all <- read.csv("../data/maxn_all.csv", row.names = 1)
+
+op_code_list <- maxn_all %>%
+  dplyr::select(region, ca_mpa_name_short,site_name, mpa_status, 
+                op_code,site_pair, year, month, day, bruv) %>%
+  as.data.frame() %>%
+  distinct()
+
+maxn_summary <- maxn_all %>% 
+  filter(class == "Actinopteri" | class == "Elasmobranchii") %>% 
+   right_join(op_code_list) %>% 
+  group_by(region, op_code, site_name,ca_mpa_name_short, site_pair, year, month, day, bruv, mpa_status) %>%
+  #
+  dplyr::summarise(maxn=sum(max_n))
+maxn_summary$maxn[is.na(maxn_summary$maxn)] <- 0 #adds 0 value to bruvs with no fish present
+
+mean_maxn <- maxn_summary %>% 
+  group_by(region, site_name,ca_mpa_name_short, site_pair,  mpa_status, year, month, day) %>% 
+  dplyr::summarise(
+    no_bruv =length(unique(bruv)),
+    maxn_survey = sum(maxn),
+    mean = maxn_survey/no_bruv, # should be fine because they all have same number of BRUVs analyzed
+    sd = sqrt(sum((maxn-mean)^2))/(no_bruv-1), # haul abundance - mean
+    min = min(maxn), 
+    max = max(maxn), 
+    median = median(maxn), 
+    n_maxn = n()) %>% 
+  mutate(standard_error = (sd / sqrt(n_maxn))) %>% 
+  arrange(region) 
+
+mean_maxn$region <- as.factor(mean_maxn$region)
+mean_maxn$mpa_status <- as.factor(mean_maxn$mpa_status)
+```
+
+
+```{r bruv richness data}
+richness_summary <- maxn_all %>% 
+  filter(class == "Actinopteri" | class == "Elasmobranchii") %>% 
+  right_join(op_code_list) %>% 
+  group_by(region, site_name,ca_mpa_name_short,site_pair, year, month, day, bruv, op_code,  mpa_status) %>% 
+  dplyr::summarise(sp_rich=sum(taxonomic_unit)) 
+
+richness_summary$sp_rich[is.na(richness_summary$sp_rich)] <- 0 #adds 0 value to bruvs with no fish present
+
+mean_richness_sampling <- richness_summary %>% 
+  group_by(region, site_name,ca_mpa_name_short, site_pair,  mpa_status,  year, month, day) %>% 
+  dplyr::summarise(
+    no_bruv =length(unique(op_code)),
+    sp_rich_survey = sum(sp_rich),
+    mean = sp_rich_survey/no_bruv) %>% 
+  arrange(region)
+
+mean_richness_sampling$region <- as.factor(mean_richness_sampling$region)
+mean_richness_sampling$mpa_status <- as.factor(mean_richness_sampling$mpa_status)
+```
+
+BRUV richness model results
+```{r bruv rich mod, echo = FALSE, warning = FALSE, message = FALSE}
+mod_log_rich <- lmer(log1p(mean)~0+mpa_status*region+(1|site_pair),  data=mean_richness_sampling)
+as_flextable(mod_log_rich) %>%   colformat_double(digits = 2)
+```
+
+Pseudo $R^2$
+```{r}
+rsq_rich <- r.squaredGLMM(mod_log_rich)
+rsq_rich
+```
+
+Anova table results
+```{r}
+aov_rich <- anova(mod_log_rich, type="3", ddf="Kenward-Roger")
+as_flextable(aov_rich) %>%   colformat_double(digits = 2)
+```
+
+Assumptions
+```{r assumpt bruv rich, echo = FALSE, warning = FALSE, message = FALSE}
+res_rich <- simulateResiduals(mod_log_rich, plot = T)# check for over dispersion NS!
+```
+
+Post hoc results
+```{r posthoc bruv rich, echo = FALSE, warning = FALSE, message = FALSE}
+post_rich_bruv_int <- emmeans(mod_log_rich, list(pairwise ~ mpa_status | region), adjust = "tukey", type = "response")
+post_rich_bruv_int
+post_rich_bruv_region <- emmeans(mod_log_rich, list(pairwise ~ region ), adjust = "tukey", type = "response")
+post_rich_bruv_region
+post_rich_bruv_mpa <- emmeans(mod_log_rich, list(pairwise ~ mpa_status ), adjust = "tukey", type = "response")
+post_rich_bruv_mpa
+```
+
+
+## Elasmobranchs 
+```{r elasmo maxn data, echo = FALSE, warning = FALSE, message = FALSE}
+elasmo_sp_b <- maxn_all %>% filter(region =="South") %>% filter(class=="Elasmobranchii")
+elasmo_sp_b$scientificname <- paste0(elasmo_sp_b$genus, " ", elasmo_sp_b$species)
+#print(unique(elasmo_sp_b$scientificname))
+maxn_summaryE <- elasmo_sp_b %>% 
+  filter(class == "Elasmobranchii") %>% 
+   right_join(op_code_list) %>% 
+  group_by(region, op_code, site_name,ca_mpa_name_short, site_pair, year, month, day, bruv,  mpa_status) %>%
+  dplyr::summarise(maxn=sum(max_n))
+
+maxn_summaryE$maxn[is.na(maxn_summaryE$maxn)] <- 0 #adds 0 value to bruvs with no fish present
+
+mean_maxnE <- maxn_summaryE %>% 
+  group_by(region, site_name,ca_mpa_name_short, site_pair, mpa_status, year, month, day) %>% 
+  dplyr::summarise(
+    no_bruv =length(unique(bruv)),
+    maxn_survey = sum(maxn),
+    mean = maxn_survey/no_bruv) %>% 
+  arrange(region) 
+mean_maxnE$no_bruv <- mean_maxn$no_bruv
+mean_maxnE <- mean_maxnE %>% 
+  mutate(mean = maxn_survey/no_bruv)
+mean_maxnE <- mean_maxnE %>% filter(region == "South") # the south did not watch 6 bruvs
+```
+
+Model summary
+```{r maxn elasm mod}
+mod_log_maxn_e <- lmer(log1p(mean)~0+mpa_status+(1|site_pair),  data=mean_maxnE)
+as_flextable(mod_log_maxn_e) %>%   colformat_double(digits = 2)
+```
+
+Pseudo $R^2$
+```{r}
+rsq_maxn_elas <- r.squaredGLMM(mod_log_maxn_e) 
+rsq_maxn_elas
+```
+
+Anova results table
+```{r}
+aov_maxn_elas <- anova(mod_log_maxn_e, type="3", ddf="Kenward-Roger")
+as_flextable(aov_maxn_elas) %>%   colformat_double(digits = 2)
+```
+
+Assumptions
+```{r assumpt maxn elasm, echo = FALSE, warning = FALSE, message = FALSE}
+res_maxn_elas <- simulateResiduals(mod_log_maxn_e, plot = T)# check for over dispersion NS!
+```
+
+Post hoc 
+```{r}
+post_elas_maxn_mpa <- emmeans(mod_log_maxn_e, list(pairwise ~ mpa_status ), adjust = "tukey", type = "response")
+
+ph_maxN_e  <- post_elas_maxn_mpa$`pairwise differences of mpa_status` %>%
+     summary(infer = TRUE) %>%  data.frame()
+```
+
+## Figures
+
+```{r rearrange data frames}
+# make some new plots
+library(ggh4x)
+library('ggthemes')
+# data
+catch_site <- pivot_longer(catch_summary_by_site_sampling[, c(1:8,16,11,13,15)], 
+                            cols = c("CPUE", "RPUE", "BPUE"),
+                            names_to = "metric",
+                            values_to = "value")
+
+catch_site2 <-  catch_site %>% 
+                dplyr::group_by(region, site_name, mpa_status, site_pair, metric) %>% 
+                dplyr::summarize(median = median(value),
+                          mean = mean(value),
+                          qt1 = quantile(value, prob = 0.25),
+                          qt3 = quantile(value, prob = 0.75),
+                          CI_L = mean - (sd(value) * 1.96)/sqrt(length(unique(value))),
+                          CI_H = mean + (sd(value) * 1.96)/sqrt(length(unique(value))))
+catch_region <-  catch_site %>% 
+  group_by(region, mpa_status, metric) %>% 
+  dplyr::summarize(median = median(value),
+            mean = mean(value),
+            qt1 = quantile(value, prob = 0.25),
+            qt3 = quantile(value, prob = 0.75),
+            CI_L = mean - (sd(value) * 1.96)/sqrt(length(unique(value))),
+            CI_H = mean + (sd(value) * 1.96)/sqrt(length(unique(value))))
+
+
+catch_site2$region <- factor(catch_site2$region, levels = c("North", "Central", "South"))
+catch_site2$metric <- factor(catch_site2$metric, levels = c("RPUE", "CPUE", "BPUE"))
+
+catch_region$region <- factor(catch_region$region, levels = c("North", "Central", "South"))
+catch_region$metric <- factor(catch_region$metric, levels = c("RPUE", "CPUE", "BPUE"))
+
+# bruvs
+maxn <- mean_maxn[, c("region", "site_name","site_pair" ,  "mpa_status", "year", "month", "day", "mean")]
+maxn$metric <- "CPUE BRUV"
+rich_bruvs <- mean_richness_sampling[, c("region", "site_name","site_pair" ,  "mpa_status", "year", "month", "day", "mean")]
+rich_bruvs$metric <- "RPUE BRUV"
+bruv <- rbind(maxn, rich_bruvs)
+colnames(bruv)[colnames(bruv)=="mean"]<- "mu"
+
+bruv_site <- bruv %>% 
+  group_by(region, site_name, mpa_status, site_pair, metric) %>% 
+  dplyr::summarize(median = median(mu),
+            mean = mean(mu),
+            qt1 = quantile(mu, prob = 0.25),
+            qt3 = quantile(mu, prob = 0.75),
+            CI_L = mean - (sd(mu) * 1.96)/sqrt(length(unique(mu))),
+            CI_H = mean + (sd(mu) * 1.96)/sqrt(length(unique(mu)))
+            )
+
+seines_bruvs_site <- rbind(catch_site2, bruv_site)
+seines_bruvs_site$region <- factor(seines_bruvs_site$region, levels = c("North", "Central", "South"))
+seines_bruvs_site$metric <- factor(seines_bruvs_site$metric, levels = c("RPUE","RPUE BRUV", "CPUE", "CPUE BRUV","BPUE"))
+
+bruv_region <- bruv %>% 
+  group_by(region, mpa_status, metric) %>% 
+  dplyr::summarize(median = median(mu),
+            mean = mean(mu),
+            qt1 = quantile(mu, prob = 0.25),
+            qt3 = quantile(mu, prob = 0.75),
+            CI_L = mean - (sd(mu) * 1.96)/sqrt(length(unique(mu))),
+            CI_H = mean + (sd(mu) * 1.96)/sqrt(length(unique(mu))))
+
+seines_bruvs_region <- rbind(catch_region, bruv_region)
+seines_bruvs_region$region <- factor(seines_bruvs_region$region, levels = c("North", "Central", "South"))
+seines_bruvs_region$metric <- factor(seines_bruvs_region$metric, levels = c("RPUE","RPUE BRUV", "CPUE", "CPUE BRUV","BPUE"))
+```
+
+```{r plot theme}
+
+dodge <- position_dodge(width=0.5)
+
+plot_theme <-  theme_tufte()+
+  theme(axis.title=element_text(size=12, color="black"),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(vjust=0.95, size = 12),
+        axis.text.x = element_text(size = 12, color = "black", angle = 45, vjust = 0.95, hjust =0.95),
+        axis.text.y = element_text(size = 12, color = "black"),
+        axis.ticks = element_line(color="black"),
+        axis.line = element_line(color="black"),
+        panel.background=element_blank(),
+        #panel.grid.major=element_blank(),
+        legend.position="bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size=10),
+        strip.background=element_blank(),
+        strip.placement = "outside",
+        #strip.text=element_blank(),
+        panel.spacing = unit(0.5, "cm","lines"))
+
+```
+
+```{r}
+seines_bruvs_site %>%  ggplot(aes(x=site_pair, y=median, color= mpa_status))+
+  geom_point(position = dodge, size = 2 )+
+  geom_errorbar(aes(ymin = qt1, ymax = qt3), position = dodge, width = 0.2)+
+  scale_color_manual(name = " ", values=c("#990000", "#3399FF")) + 
+  facet_wrap2(metric ~ ., scales = "free_y",
+             nrow = 5, 
+             strip.position = "left",axes = "all", remove_labels = "x") + 
+  labs(x= "Site Pair",
+       y = " ")+ plot_theme
+```
+
+```{r}
+seines_bruvs_region %>%  ggplot(aes(x=region, y=median, color= mpa_status))+
+  geom_point(position = dodge, size = 3 )+
+  geom_errorbar(aes(ymin = qt1, ymax = qt3), position = dodge, width = 0.2)+
+  scale_color_manual(name = " ", values=c("#990000", "#3399FF")) + 
+  facet_wrap2(metric ~ ., scales = "free_y",
+              nrow = 5, 
+              strip.position = "left", axes = "all", remove_labels = "all") + 
+  labs(x= "Region",
+       y = " ")+ plot_theme
+```
